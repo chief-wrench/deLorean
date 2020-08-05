@@ -1,0 +1,225 @@
+#!/bin/bash
+ ###############################################
+# rotating backup script                        #
+ ###############################################
+#  “The way I see it, if you’re gonna build a   #
+#  time machine into a car, why not do it with  #
+#  some style?”                                 #
+ # changelog ###################################
+# v16: remote connection via ftp and fusemount  #
+# v15: remote connection via rsync + ssh + sudo #
+# v14: atomic lock                              #
+# v13: dates calculated correctly               #
+ ###############################################
+# dependencies: curlftpfs, rsync                #
+# author: Oliver Quandt, oq@hirsa.de            #
+# license: fair use, i.e. GPL yadda yadda       #
+ # FTP-otions ##################################
+#FTPHOST="hirsa.de"                             #
+#FTPUSER=""                                     #
+#FTPPASS=""                                     #
+ # OSX specific: ###############################
+#DATECMD="date -r "                             #
+#LSCMD="ls -c"                                  #
+ # Linux-specific: #############################
+DATECMD="date -d @"                             #
+LSCMD="ls -tr"                                  #
+ # non-OS-specific #############################
+RSYNC="/usr/bin/rsync"                          #
+TMPDIR="/tmp"                                   #
+MYNAME="deLorean"                               #
+ ###############################################
+
+check_snapshot () { 
+# check if the snapshot was finished successfully. remove if not
+    if [ ! -f $1/stop.time ]; then
+        echo "Unfinished Snapshot found: $1. Exterminate!" >> $JOBINFO
+        rm -rf $1
+    fi
+}
+
+usage () { # give some hints
+    echo "Usage: $0 <sourcedir> <backup_rootdir> <target> <local|ssh:port|rsyncssh|rsyncsshsudo|ftp> <years> [months[days[hours[minutes[seconds]]]]]"
+    exit 2
+}
+
+if (( $# < 5 || $# > 10 )); then
+    usage
+fi
+
+typeset -i KEEP MHD EXPIRES RSYNCEXITCODE
+
+SOURCEDIR=$1
+BUROOT=`echo $2 | sed -e 's|/$||g'`
+TARGET=$3
+CMD=$4
+KEEP=$(((((($5*12+$6)*31+$7)*24+$8)*60+$9)*60+${10}))
+NOW=`date '+%s'`
+MHD=$(( NOW + KEEP ))
+LOCKDIR="/var/run/$MYNAME$BUROOT/$TARGET"
+LOGDIR="$LOCKDIR/meta"
+JOBINFO="$LOGDIR/jobinfo.txt"
+
+mkdir -p /var/run/$MYNAME$BUROOT    # create folder above actual lock folder
+mkdir $LOCKDIR                      # try to create lock folder
+if [ $? -eq 0 ]; then               #if that worked, proceed
+
+    mkdir $LOGDIR
+
+    for I in $BUROOT/$TARGET/*; do
+        check_snapshot $I
+    done
+
+    # in case you want to backup the root directory (i.e. "/")
+    SRCPATH=`echo "$1" | cut -d/ -f1 --complement`
+    if [ ! $SRCPATH ]; then
+        echo "It seems you want to backup directory \"/\". Substituting \"slash\" for tidyness." >> $JOBINFO
+        SLASH=slash/
+    else
+        SLASH=""
+        SRCPATH=/$SRCPATH
+    fi
+
+    NOWDIR=`$DATECMD$NOW "+%Y-%m-%d-%H-%M-%S-%a"`
+    # evaluate most recent snapshot for hardlinking
+    COMPAREDIR=$BUROOT/$TARGET/`$LSCMD $BUROOT/$TARGET | tail -n1`
+    mkdir -pv $BUROOT/$TARGET/$NOWDIR >> $JOBINFO
+    rm $BUROOT/$TARGET/current >> $JOBINFO
+    ln -s $BUROOT/$TARGET/$NOWDIR $BUROOT/$TARGET/current >> $JOBINFO
+    mv $LOGDIR $BUROOT/$TARGET/$NOWDIR/
+    ln -s $BUROOT/$TARGET/$NOWDIR/meta $LOGDIR
+    LOGDIR="$BUROOT/$TARGET/$NOWDIR/meta"
+    RSYNCLOG="$LOGDIR/rsync.log"
+#    ln -s $BUROOT/$TARGET/$NOWDIR/synclog.txt $RSYNCLOG
+    ERRORLOG="$LOGDIR/errorlog.txt"
+#    ln -s $BUROOT/$TARGET/$NOWDIR/errorlog.txt $ERRORLOG
+    JOBINFO="$LOGDIR/jobinfo.txt"
+
+    EXCLUDEFILE="/etc/$MYNAME$BUROOT/$TARGET/exclude"
+    if [ ! -f $EXCLUDEFILE ]; then
+        echo "First run ??? touching exclude file $EXCLUDEFILE" >> $JOBINFO
+        mkdir -pv /etc/$MYNAME$BUROOT/$TARGET >> $JOBINFO
+        touch $EXCLUDEFILE
+    fi
+
+    if [[ $CMD == ssh:* ]]; then
+            SSHPORT=$(echo $CMD | cut -f2 -d:)
+            CMD=ssh
+    fi
+
+    # put scripts for database snapshots etc into this directory, uncomment line
+    #. /etc/$MYNAME/pre/*
+
+    # get serious
+    case "$CMD" in
+        local)
+            $RSYNC -ax --exclude-from=$EXCLUDEFILE --link-dest=$COMPAREDIR/$SLASH $SOURCEDIR $BUROOT/$TARGET/$NOWDIR/$SLASH --log-file=$RSYNCLOG 2>$ERRORLOG
+            RSYNCEXITCODE=$?
+        ;;
+        rsyncssh)
+            $RSYNC -axz --exclude-from=$EXCLUDEFILE --link-dest=$COMPAREDIR/$SLASH $SOURCEDIR $BUROOT/$TARGET/$NOWDIR/$SLASH --log-file=$RSYNCLOG 2>$ERRORLOG
+            RSYNCEXITCODE=$?
+        ;;
+        ssh)
+            $RSYNC -axz -e "ssh -p $SSHPORT" --exclude-from=$EXCLUDEFILE --link-dest=$COMPAREDIR/$SLASH $SOURCEDIR $BUROOT/$TARGET/$NOWDIR/$SLASH --log-file=$RSYNCLOG 2>$ERRORLOG
+            RSYNCEXITCODE=$?
+        ;;
+        rsyncsshsudo)
+            $RSYNC -axz -e ssh --rsync-path="sudo rsync" --exclude-from=$EXCLUDEFILE --link-dest=$COMPAREDIR/$SLASH $SOURCEDIR $BUROOT/$TARGET/$NOWDIR/$SLASH --log-file=$RSYNCLOG 2>$ERRORLOG
+            RSYNCEXITCODE=$?
+        ;;
+        ftp)
+            mkdir -p $BUROOT/.mount/$TARGET/
+            curlftpfs $SOURCEDIR $BUROOT/.mount/$TARGET/
+            $RSYNC -ax --exclude-from=$EXCLUDEFILE --link-dest=$COMPAREDIR/$SLASH $BUROOT/.mount/$TARGET$SRCPATH $BUROOT/$TARGET/$NOWDIR/$SLASH --log-file=$RSYNCLOG 2>$ERRORLOG
+            RSYNCEXITCODE=$?
+            fusermount -u $BUROOT/.mount/$TARGET/
+        ;;
+        *)
+            usage
+        ;;
+    esac
+
+    echo $RSYNCEXITCODE > $LOGDIR/rsync.exitcode
+    echo $MHD > "$BUROOT/$TARGET/$NOWDIR/mhd.time"
+    echo $NOW > "$LOGDIR/start.time"
+    echo $MHD > "$LOGDIR/mhd.time"
+    echo "Job started at `$DATECMD$NOW "+%Y-%m-%d %H:%M:%S"`" >> $JOBINFO
+    echo >> $JOBINFO
+    echo "This snapshot is kept for $5 years $6 months $7 days $8 hours $9 minutes ${10} seconds." >> $JOBINFO
+    echo >> $JOBINFO
+    echo "It should automagically be deleted after `$DATECMD$MHD "+%Y-%m-%d %H:%M:%S"`" >> $JOBINFO
+
+        # evaluate snapshots which have reached their max age, exterminate!
+    for I in `$LSCMD $BUROOT/$TARGET` ; do
+        EXPIRES=`cat $BUROOT/$TARGET/$I/mhd.time`
+        if [ $EXPIRES -lt $NOW ]; then
+            echo >> $JOBINFO
+            echo "$BUROOT/$TARGET/$I has reached max age. Exterminate!" >> $JOBINFO
+            rm -r $BUROOT/$TARGET/$I
+        fi
+    done
+     
+    #. /etc/$MYNAME.d/post/*
+     
+    echo >> $JOBINFO
+    STOPDATE=`date '+%s'`
+    echo "Job stopped at `$DATECMD$STOPDATE "+%Y-%m-%d %H:%M:%S"`" >> $JOBINFO
+    echo $STOPDATE > $BUROOT/$TARGET/$NOWDIR/stop.time
+    echo $STOPDATE > $LOGDIR/stop.time
+    du -s $BUROOT/$TARGET/$NOWDIR/$SLASH | cut -f1 > $LOGDIR/du.bytes
+    echo "removing lock: $LOCKDIR" >> $JOBINFO
+    rm -r $LOCKDIR >> $JOBINFO
+else
+    echo "OOPS, at $NOW another $MYNAME tried running the same job!" >> $LOCKDIR/meta/errorlog.txt
+    exit 1;
+fi
+
+# #!/bin/bash
+
+# TEXTFILE_COLLECTOR_DIR=/var/lib/node_exporter/
+# LAST_BACKUP_DIR=/data/backup/mongodb/default/latest/
+
+# # Note the start time of the script.
+# START="$(date +%s)"
+
+# /usr/bin/mongodb-consistent-backup "$@"
+# EXIT_CODE=$?
+
+# if [ ${EXIT_CODE} -ne 0 ]; then
+#     LAST_BACKUP_SIZE=0
+# else
+#     LAST_BACKUP_SIZE=$(du -bs "${LAST_BACKUP_DIR}" | cut -f1)
+# fi
+
+# # Write out metrics to a temporary file.
+# END="$(date +%s)"
+
+# cat << EOF > "${TEXTFILE_COLLECTOR_DIR}/mongodb-consistent-backup.prom.$$"
+# # HELP mongodb_consistent_backup_duration_seconds backup duration in seconds
+# # TYPE mongodb_consistent_backup_duration_seconds gauge
+# mongodb_consistent_backup_duration_seconds $((${END} - ${START}))
+
+# # HELP mongodb_consistent_backup_last_run_seconds timestamp of when the last backup job finished 
+# # TYPE mongodb_consistent_backup_last_run_seconds counter
+# mongodb_consistent_backup_last_run_seconds ${END}
+
+# # HELP mongodb_consistent_backup_bytes size of the compressed backup artifacts 
+# # TYPE mongodb_consistent_backup_bytes gauge
+# mongodb_consistent_backup_bytes ${LAST_BACKUP_SIZE}
+
+# # HELP mongodb_consistent_backup_exit_code exit code of the last backup job (0 = success)
+# # TYPE mongodb_consistent_backup_exit_code gauge
+# mongodb_consistent_backup_exit_code ${EXIT_CODE}
+# EOF
+
+# # Rename the temporary file atomically.
+# # This avoids the node exporter seeing half a file.
+# mv "${TEXTFILE_COLLECTOR_DIR}/mongodb-consistent-backup.prom.$$" \
+#   "${TEXTFILE_COLLECTOR_DIR}/mongodb-consistent-backup.prom"
+
+# exit ${EXIT_CODE}
+
+# https://www.robustperception.io/using-the-textfile-collector-from-a-shell-script
+# https://www.reddit.com/r/PrometheusMonitoring/comments/hb66ug/what_is_the_best_way_to_get_my_cron_job_results/
+# https://github.com/paulfantom/dockerfiles/blob/master/restic-mysql/entrypoint.sh#L80-L96
